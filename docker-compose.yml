@@ -1,0 +1,46 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: smartinvoice
+      MYSQL_USER: smartinvoice
+      MYSQL_PASSWORD: smartinvoice
+      MYSQL_ROOT_PASSWORD: smartinvoice_root
+    ports:
+      - "3307:3306"
+    volumes:
+      - smartinvoice_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql+pymysql://smartinvoice:smartinvoice@mysql:3306/smartinvoice
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODELS: ${GROQ_MODELS:-meta-llama/llama-4-scout-17b-16e-instruct,llama-3.3-70b-versatile,llama-3.1-8b-instant}
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+
+  api:
+    build: .
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql+pymysql://smartinvoice:smartinvoice@mysql:3306/smartinvoice
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    ports:
+      - "8000:8000"
+
+volumes:
+  smartinvoice_mysql:
