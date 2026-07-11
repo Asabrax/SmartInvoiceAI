@@ -5,11 +5,22 @@ import pandas as pd
 from utils import invoice_dataframe, parse_date
 
 
+SPEND_STATUSES = {"Approved", "Paid"}
+
+
+def spend_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = invoice_dataframe(rows)
+    if df.empty:
+        return df
+    return df[df["status"].isin(SPEND_STATUSES)].copy()
+
+
 def dashboard_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     df = invoice_dataframe(rows)
     if df.empty:
         return {"invoice_count": 0, "total_spend": 0.0, "average_invoice": 0.0, "high_risk_count": 0, "pending_count": 0}
-    totals = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0)
+    spend_df = spend_dataframe(rows)
+    totals = pd.to_numeric(spend_df["total_amount"], errors="coerce").fillna(0)
     risk = pd.to_numeric(df["risk_score"], errors="coerce").fillna(0)
     return {
         "invoice_count": int(len(df)),
@@ -21,7 +32,7 @@ def dashboard_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def monthly_trend(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = invoice_dataframe(rows)
+    df = spend_dataframe(rows)
     if df.empty:
         return pd.DataFrame(columns=["month", "total_amount", "invoice_count", "average_amount", "flagged_rate"])
     df["parsed_date"] = df["invoice_date"].apply(parse_date)
@@ -43,7 +54,7 @@ def monthly_trend(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def vendor_spend(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = invoice_dataframe(rows)
+    df = spend_dataframe(rows)
     if df.empty:
         return pd.DataFrame(columns=["vendor_name", "total_amount", "invoice_count", "risk_score"])
     df["vendor_name"] = df["vendor_name"].fillna("Unknown")

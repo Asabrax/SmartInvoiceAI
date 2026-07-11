@@ -1,6 +1,8 @@
 import os
 import tempfile
 
+import pytest
+
 os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False).name}"
 
 import database
@@ -74,3 +76,10 @@ def test_demo_data_seeds_fresh_database():
     assert inserted >= 1
     assert len(rows) >= inserted
     assert any(row["model_used"] == "demo-dataset" for row in rows)
+
+
+def test_status_updates_validate_status_and_missing_ids():
+    with pytest.raises(ValueError):
+        database.update_invoice_status(1, "MadeUp")
+    assert database.update_invoice_status(999999, "Approved") is False
+    assert database.bulk_update_status([999998, 999999], "Approved") == 0

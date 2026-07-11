@@ -1,19 +1,29 @@
 import os
-from typing import List, Optional
+import secrets
+from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 
 from database import init_db, list_invoices, save_invoice
 from risk_rules import score_invoice_risk
-from utils import content_hash, detect_invoice_type, extract_invoice_with_fallback, model_dump, process_document_bytes
+from utils import (
+    MAX_DOCUMENT_BYTES,
+    content_hash,
+    detect_invoice_type,
+    extract_invoice_with_fallback,
+    model_dump,
+    process_document_bytes,
+)
 
 
-app = FastAPI(title="SmartInvoiceAI API", version="1.0")
-
-
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     init_db()
+    yield
+
+
+app = FastAPI(title="SmartInvoiceAI API", version="1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -21,18 +31,37 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    configured_key = os.getenv("SMARTINVOICEAI_API_KEY", "").strip()
+    if not configured_key:
+        raise HTTPException(status_code=503, detail="API authentication is not configured")
+    if not secrets.compare_digest(x_api_key or "", configured_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 @app.get("/invoices")
-def invoices(status: Optional[str] = None) -> list:
-    return list_invoices(status=status)
+def invoices(
+    status: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    include_text: bool = False,
+    _: None = Depends(require_api_key),
+) -> list:
+    return list_invoices(status=status, limit=limit, offset=offset, include_text=include_text)
 
 
 @app.post("/ingest")
-async def ingest_invoice(file: UploadFile = File(...), language: str = "English") -> dict:
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+async def ingest_invoice(
+    file: UploadFile = File(...),
+    language: str = "English",
+    _: None = Depends(require_api_key),
+) -> dict:
+    data = await file.read(MAX_DOCUMENT_BYTES + 1)
 
-    document = process_document_bytes(file.filename or "invoice", data, file.content_type)
+    try:
+        document = process_document_bytes(file.filename or "invoice", data, file.content_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     invoice, confidence, model_used, warnings = extract_invoice_with_fallback(
         document=document,
         language=language,

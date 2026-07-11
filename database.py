@@ -2,7 +2,7 @@ import json
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -16,7 +16,6 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
-    func,
     select,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
@@ -24,6 +23,12 @@ from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 DEFAULT_DB_PATH = Path("data") / "smart_invoice_ai.sqlite3"
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")
+VALID_STATUSES = {"Submitted", "Reviewed", "Approved", "Rejected", "Paid", "Flagged"}
+SPEND_STATUSES = {"Approved", "Paid"}
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _engine_kwargs() -> Dict[str, Any]:
@@ -55,8 +60,8 @@ class InvoiceRecord(Base):
     fraud_flags = Column(JSON, default=list)
     warnings = Column(JSON, default=list)
     notes = Column(Text, default="")
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     audit_events = relationship("AuditEvent", back_populates="invoice", cascade="all, delete-orphan")
 
@@ -70,8 +75,8 @@ class ProcessingJob(Base):
     status = Column(String(32), default="Queued", index=True)
     detail = Column(Text, default="")
     invoice_id = Column(Integer, ForeignKey("invoice_records.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class AuditEvent(Base):
@@ -81,7 +86,7 @@ class AuditEvent(Base):
     invoice_id = Column(Integer, ForeignKey("invoice_records.id"), nullable=True)
     action = Column(String(80), nullable=False)
     detail = Column(Text, default="")
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     invoice = relationship("InvoiceRecord", back_populates="audit_events")
 
@@ -124,24 +129,18 @@ def update_job(job_id: int, status: str, detail: str = "", invoice_id: Optional[
 
 
 def duplicate_count(session: Session, file_hash: str, invoice_number: Optional[str], vendor_name: Optional[str]) -> int:
-    count = session.scalar(select(func.count()).select_from(InvoiceRecord).where(InvoiceRecord.file_hash == file_hash)) or 0
-    if invoice_number:
-        query = select(func.count()).select_from(InvoiceRecord).where(
-            func.lower(func.json_extract(InvoiceRecord.data, "$.invoice_number")) == invoice_number.lower()
-        )
-        if vendor_name:
-            query = query.where(func.lower(func.json_extract(InvoiceRecord.data, "$.vendor_name")) == vendor_name.lower())
-        try:
-            count += session.scalar(query) or 0
-        except Exception:
-            rows = session.scalars(select(InvoiceRecord)).all()
-            count += sum(
-                1
-                for row in rows
-                if (row.data or {}).get("invoice_number", "").lower() == invoice_number.lower()
-                and (not vendor_name or (row.data or {}).get("vendor_name", "").lower() == vendor_name.lower())
-            )
-    return int(count)
+    invoice_number = (invoice_number or "").casefold()
+    vendor_name = (vendor_name or "").casefold()
+    rows = session.execute(select(InvoiceRecord.file_hash, InvoiceRecord.data)).all()
+    count = 0
+    for stored_hash, data in rows:
+        data = data or {}
+        same_identity = bool(invoice_number) and str(data.get("invoice_number") or "").casefold() == invoice_number
+        if same_identity and vendor_name:
+            same_identity = str(data.get("vendor_name") or "").casefold() == vendor_name
+        if stored_hash == file_hash or same_identity:
+            count += 1
+    return count
 
 
 def save_invoice(
@@ -206,12 +205,21 @@ def record_audit(invoice_id: Optional[int], action: str, detail: str = "") -> No
         session.add(AuditEvent(invoice_id=invoice_id, action=action, detail=detail))
 
 
-def list_invoices(status: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_invoices(
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    include_text: bool = True,
+) -> List[Dict[str, Any]]:
     with session_scope() as session:
         stmt = select(InvoiceRecord).order_by(InvoiceRecord.created_at.desc())
         if status:
             stmt = stmt.where(InvoiceRecord.status == status)
-        return [_record_to_dict(record) for record in session.scalars(stmt).all()]
+        if offset:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return [_record_to_dict(record, include_text=include_text) for record in session.scalars(stmt).all()]
 
 
 def get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
@@ -220,23 +228,26 @@ def get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
         return _record_to_dict(record) if record else None
 
 
-def update_invoice_status(invoice_id: int, status: str, notes: str = "") -> None:
+def update_invoice_status(invoice_id: int, status: str, notes: str = "") -> bool:
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Unknown invoice status: {status}")
     with session_scope() as session:
         record = session.get(InvoiceRecord, invoice_id)
         if not record:
-            return
+            return False
         old_status = record.status
         record.status = status
         if notes:
             record.notes = notes
         session.add(AuditEvent(invoice_id=invoice_id, action="status_changed", detail=f"{old_status} -> {status}. {notes}"))
+        return True
 
 
 def bulk_update_status(invoice_ids: Iterable[int], status: str, notes: str = "") -> int:
     changed = 0
     for invoice_id in invoice_ids:
-        update_invoice_status(int(invoice_id), status, notes)
-        changed += 1
+        if update_invoice_status(int(invoice_id), status, notes):
+            changed += 1
     return changed
 
 
@@ -273,8 +284,8 @@ def list_audit_events(limit: int = 50) -> List[Dict[str, Any]]:
         ]
 
 
-def _record_to_dict(record: InvoiceRecord) -> Dict[str, Any]:
-    return {
+def _record_to_dict(record: InvoiceRecord, include_text: bool = True) -> Dict[str, Any]:
+    result = {
         "id": record.id,
         "filename": record.filename,
         "file_hash": record.file_hash,
@@ -283,7 +294,6 @@ def _record_to_dict(record: InvoiceRecord) -> Dict[str, Any]:
         "category": record.category,
         "model_used": record.model_used,
         "risk_score": record.risk_score,
-        "extracted_text": record.extracted_text,
         "data": record.data or {},
         "confidence_scores": record.confidence_scores or {},
         "fraud_flags": record.fraud_flags or [],
@@ -292,6 +302,9 @@ def _record_to_dict(record: InvoiceRecord) -> Dict[str, Any]:
         "created_at": record.created_at.isoformat(),
         "updated_at": record.updated_at.isoformat(),
     }
+    if include_text:
+        result["extracted_text"] = record.extracted_text
+    return result
 
 
 def vendor_summary() -> List[Dict[str, Any]]:
@@ -303,7 +316,8 @@ def vendor_summary() -> List[Dict[str, Any]]:
         total = float(data.get("total_amount") or 0)
         summary = vendors.setdefault(vendor, {"vendor_name": vendor, "invoice_count": 0, "total_spend": 0.0, "risk_score": 0.0})
         summary["invoice_count"] += 1
-        summary["total_spend"] += total
+        if row["status"] in SPEND_STATUSES:
+            summary["total_spend"] += total
         summary["risk_score"] = max(summary["risk_score"], row.get("risk_score") or 0.0)
     return sorted(vendors.values(), key=lambda item: item["total_spend"], reverse=True)
 

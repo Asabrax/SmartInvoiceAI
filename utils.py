@@ -14,9 +14,14 @@ import pandas as pd
 import requests
 from groq import Groq
 from PIL import Image, ImageEnhance
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pypdf import PdfReader
 from risk_rules import normalize_currency, score_invoice_risk
+
+
+MAX_DOCUMENT_BYTES = int(os.getenv("SMARTINVOICEAI_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+ALLOWED_DOCUMENT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg"}
+ALLOWED_DOCUMENT_TYPES = {"application/pdf", "image/png", "image/jpeg"}
 
 
 class LineItem(BaseModel):
@@ -24,6 +29,13 @@ class LineItem(BaseModel):
     quantity: Optional[float] = Field(None, description="Number of units.")
     unit_price: Optional[float] = Field(None, description="Price per unit.")
     total_price: Optional[float] = Field(None, description="Line item total.")
+
+    @field_validator("quantity", "unit_price", "total_price")
+    @classmethod
+    def validate_numbers(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value < 0:
+            raise ValueError("Invoice values cannot be negative")
+        return round(value, 2) if value is not None else None
 
 
 class InvoiceData(BaseModel):
@@ -41,6 +53,13 @@ class InvoiceData(BaseModel):
     total_amount: Optional[float] = Field(None, description="Final amount due.")
     currency: Optional[str] = Field(None, description="ISO currency code such as EUR, USD, GBP, or INR.")
     payment_terms: Optional[str] = Field(None, description="Payment terms such as Net 30, due on receipt, or bank transfer terms.")
+
+    @field_validator("subtotal", "tax", "total_amount")
+    @classmethod
+    def validate_amounts(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value < 0:
+            raise ValueError("Invoice amounts cannot be negative")
+        return round(value, 2) if value is not None else None
 
 
 @dataclass
@@ -75,15 +94,27 @@ def process_image_upload(uploaded_file):
     return image_bytes, mime_type
 
 
-def process_image_url(image_url):
-    if not image_url:
-        return None
-    try:
-        response = requests.get(image_url, timeout=20)
-        response.raise_for_status()
-        return response.content
-    except Exception as exc:
-        raise ValueError(f"Error loading image from URL: {exc}") from exc
+def validate_document_upload(filename: str, data: bytes, content_type: Optional[str] = None) -> None:
+    if not data:
+        raise ValueError("Uploaded file is empty")
+    if len(data) > MAX_DOCUMENT_BYTES:
+        limit_mb = MAX_DOCUMENT_BYTES / (1024 * 1024)
+        raise ValueError(f"File exceeds the {limit_mb:g} MB upload limit")
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_DOCUMENT_SUFFIXES:
+        raise ValueError("Only PDF, PNG, and JPEG files are supported")
+    if content_type and content_type not in ALLOWED_DOCUMENT_TYPES and content_type != "application/octet-stream":
+        raise ValueError("Unsupported document content type")
+
+    signatures = {
+        ".pdf": data.startswith(b"%PDF-"),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+    }
+    if not signatures[suffix]:
+        raise ValueError("File content does not match its extension")
 
 
 def preprocess_image(image_bytes: bytes) -> bytes:
@@ -316,6 +347,7 @@ def _pdf_page_images(pdf_bytes: bytes, max_pages: int = 3) -> Tuple[List[Dict[st
 
 
 def process_document_bytes(filename: str, data: bytes, content_type: Optional[str] = None) -> ProcessedDocument:
+    validate_document_upload(filename, data, content_type)
     suffix = Path(filename).suffix.lower()
     warnings: List[str] = []
     image_payloads: List[Dict[str, Any]] = []

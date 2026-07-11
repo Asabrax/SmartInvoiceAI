@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from analytics import dashboard_metrics, monthly_trend, score_anomalies, vendor_spend
+from analytics import SPEND_STATUSES, dashboard_metrics, monthly_trend, score_anomalies, vendor_spend
 from database import (
     bulk_update_status,
     create_job,
@@ -31,7 +31,6 @@ from utils import (
     model_dump,
     OllamaClient,
     process_document_bytes,
-    process_image_url,
 )
 from risk_rules import score_invoice_risk
 
@@ -148,6 +147,7 @@ def category_spend(rows: List[Dict]) -> pd.DataFrame:
     df = invoice_dataframe(rows)
     if df.empty:
         return pd.DataFrame(columns=["Category", "Amount"])
+    df = df[df["status"].isin(SPEND_STATUSES)]
     return (
         df.groupby("category", as_index=False)["total_amount"]
         .sum()
@@ -469,25 +469,6 @@ def process_upload(
         raise
 
 
-def process_url(
-    image_url: str,
-    language: str,
-    groq_api_key: Optional[str],
-    models: List[str],
-    local_model: Optional[str],
-    local_base_url: str,
-) -> int:
-    raw = process_image_url(image_url)
-    class UrlUpload:
-        name = image_url.rsplit("/", 1)[-1] or "invoice-url.jpg"
-        type = "image/jpeg"
-
-        def read(self):
-            return raw
-
-    return process_upload(UrlUpload(), language, groq_api_key, models, local_model, local_base_url)
-
-
 def render_dashboard(rows: List[Dict], theme: str) -> None:
     metrics = dashboard_metrics(rows)
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -497,7 +478,7 @@ def render_dashboard(rows: List[Dict], theme: str) -> None:
     c4.metric("High priority risk", metrics["high_risk_count"])
     c5.metric("Pending approval", metrics["pending_count"])
     dataset_label = "local Ollama-extracted invoices" if local_ai_rows(rows) else "synthetic BremenTech GmbH fallback invoices"
-    st.caption(f"Dataset: {dataset_label}, 2025-2026. High priority risk = risk score >= 50.")
+    st.caption(f"Dataset: {dataset_label}, 2025-2026. Spend includes approved and paid invoices. High priority risk = risk score >= 50.")
 
     if not rows:
         st.info("No invoices yet. Upload PDFs or images in Intake.")
@@ -633,11 +614,9 @@ def render_intake(
         type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
-    url = st.text_input("Or process an image URL")
-
     col1, col2 = st.columns([1, 3])
     with col1:
-        start = st.button("Process queue", type="primary", disabled=not uploads and not url)
+        start = st.button("Process queue", type="primary", disabled=not uploads)
     with col2:
         if local_model:
             st.info(f"Local AI extraction is enabled through Ollama model `{local_model}`. If Ollama is unavailable, the parser falls back safely.")
@@ -651,15 +630,13 @@ def render_intake(
         progress = st.progress(0)
         results = []
         errors = []
-        total = len(tasks) + (1 if url else 0)
+        total = len(tasks)
         completed = 0
         with ThreadPoolExecutor(max_workers=min(4, max(total, 1))) as executor:
             futures = [
                 executor.submit(process_upload, upload, language, groq_api_key, models, local_model, local_base_url)
                 for upload in tasks
             ]
-            if url:
-                futures.append(executor.submit(process_url, url, language, groq_api_key, models, local_model, local_base_url))
             for future in as_completed(futures):
                 completed += 1
                 progress.progress(completed / total)

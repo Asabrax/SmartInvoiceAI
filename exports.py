@@ -10,6 +10,9 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from utils import invoice_dataframe
 
 
+SPEND_STATUSES = {"Approved", "Paid"}
+
+
 def invoices_to_csv(rows: List[Dict[str, Any]]) -> str:
     return invoice_dataframe(rows).to_csv(index=False)
 
@@ -22,8 +25,9 @@ def invoices_to_excel(rows: List[Dict[str, Any]]) -> bytes:
         if df.empty:
             vendors = pd.DataFrame(columns=["vendor_name", "invoice_count", "total_spend"])
         else:
+            spend_df = df[df["status"].isin(SPEND_STATUSES)]
             vendors = (
-                df.groupby("vendor_name", dropna=False)["total_amount"]
+                spend_df.groupby("vendor_name", dropna=False)["total_amount"]
                 .agg(["count", "sum"])
                 .reset_index()
                 .rename(columns={"count": "invoice_count", "sum": "total_spend"})
@@ -44,9 +48,10 @@ def invoices_to_pdf(rows: List[Dict[str, Any]]) -> bytes:
     story = [Paragraph("SmartInvoiceAI Invoice Report", styles["Title"]), Spacer(1, 12)]
 
     df = invoice_dataframe(rows)
-    total_spend = float(df["total_amount"].fillna(0).sum()) if not df.empty and "total_amount" in df else 0.0
+    spend_df = df[df["status"].isin(SPEND_STATUSES)] if not df.empty else df
+    total_spend = float(spend_df["total_amount"].fillna(0).sum()) if not spend_df.empty else 0.0
     story.append(Paragraph(f"Invoices: {len(df)}", styles["Normal"]))
-    story.append(Paragraph(f"Total spend: {total_spend:,.2f}", styles["Normal"]))
+    story.append(Paragraph(f"Approved and paid spend: {total_spend:,.2f}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
     columns = ["invoice_number", "vendor_name", "status", "category", "total_amount", "risk_score"]
